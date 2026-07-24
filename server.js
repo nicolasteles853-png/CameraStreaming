@@ -13,7 +13,7 @@ const PORT_VIDEO_BASE = Number(process.env.PORT_VIDEO_BASE || 3001);
 const PORT_AUDIO_BASE = Number(process.env.PORT_AUDIO_BASE || 3002);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-const ROOT = "/data/data/com.termux/files/home/CameraStreaming";
+const ROOT = "/streams";
 const STREAMS_DIR = path.join(ROOT, "streams");
 const USERS_FILE = path.join(ROOT, "users.json");
 const STREAMS_FILE = path.join(ROOT, "streams.json");
