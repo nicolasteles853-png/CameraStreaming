@@ -11,30 +11,16 @@ const PORT_AUDIO_BASE = Number(process.env.PORT_AUDIO_BASE || 3002);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
 const ROOT = (() => {
-  const candidates = [
-    process.env.STREAM_ROOT,
-    "/var/data/camera-stream",
-    path.join(__dirname, "camera-stream"),
-    path.join(process.cwd(), "camera-stream")
-  ].filter(Boolean);
-
-  for (const dir of candidates) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      return dir;
-    } catch {}
-  }
-
-  throw new Error("Não foi possível criar diretório ROOT.");
+  const dir = path.join(__dirname, "camera-stream");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
 })();
 
 const STREAMS_DIR = path.join(ROOT, "streams");
 const USERS_FILE = path.join(ROOT, "users.json");
 const STREAMS_FILE = path.join(ROOT, "streams.json");
 
-try {
-  fs.mkdirSync(STREAMS_DIR, { recursive: true });
-} catch {}
+fs.mkdirSync(STREAMS_DIR, { recursive: true });
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -44,9 +30,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
 const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 10 * 60 * 1000);
 const loginAttempts = new Map();
-
-if (!fs.existsSync(ROOT)) fs.mkdirSync(ROOT, { recursive: true });
-if (!fs.existsSync(STREAMS_DIR)) fs.mkdirSync(STREAMS_DIR, { recursive: true });
 
 function readJson(filePath, fallback) {
   try {
@@ -144,7 +127,7 @@ function createStream(username, apiKey) {
   const audioPort = PORT_AUDIO_BASE + index * 2;
 
   const dir = path.join(STREAMS_DIR, username);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
 
   const playlist = path.join(dir, "stream.m3u8");
   const segmentPattern = path.join(dir, "stream%d.ts");
@@ -615,7 +598,7 @@ function handleRequest(req, res) {
     return;
   }
 
- const liveMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream\\.m3u8$").exec(req.url);
+  const liveMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream\\.m3u8$").exec(req.url);
   if (liveMatch) {
     const [, username, apiKey] = liveMatch;
     const stream = streams[username];
@@ -642,7 +625,7 @@ function handleRequest(req, res) {
     return;
   }
 
- const segmentMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream(\\d+)\\.ts$").exec(req.url);
+  const segmentMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream(\\d+)\\.ts$").exec(req.url);
   if (segmentMatch) {
     const [, username, apiKey, index] = segmentMatch;
     const stream = streams[username];
