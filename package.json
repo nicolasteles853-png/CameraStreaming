@@ -19,5 +19,13 @@
     "socket.io": "^4.8.3",
     "stream": "^0.0.3"
   },
-  "devDependencies": {}
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicolasteles853-png/CameraStreaming.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nicolasteles853-png/CameraStreaming/issues"
+  },
+  "homepage": "https://github.com/nicolasteles853-png/CameraStreaming#readme"
 }

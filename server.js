@@ -1,36 +1,48 @@
 const net = require("net");
 const http = require("http");
-const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 
-// Variáveis de ambiente (Railway Lê direto do painel)
-const HTTP_PORT = Number(process.env.HTTP_PORT || 3000);
-const HTTPS_PORT = Number(process.env.HTTPS_PORT || 3443);
+const PORT = Number(process.env.PORT || 10000);
 const PORT_VIDEO_BASE = Number(process.env.PORT_VIDEO_BASE || 3001);
 const PORT_AUDIO_BASE = Number(process.env.PORT_AUDIO_BASE || 3002);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-const ROOT = "/streams";
+const ROOT = (() => {
+  const candidates = [
+    process.env.STREAM_ROOT,
+    "/var/data/camera-stream",
+    path.join(__dirname, "camera-stream"),
+    path.join(process.cwd(), "camera-stream")
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    } catch {}
+  }
+
+  throw new Error("Não foi possível criar diretório ROOT.");
+})();
+
 const STREAMS_DIR = path.join(ROOT, "streams");
 const USERS_FILE = path.join(ROOT, "users.json");
 const STREAMS_FILE = path.join(ROOT, "streams.json");
 
-// Certificados (gerar com openssl ou usar variáveis de ambiente no Railway)
-const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "/data/data/com.termux/files/home/CameraStreaming/key.pem";
-const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "/data/data/com.termux/files/home/CameraStreaming/cert.pem";
+try {
+  fs.mkdirSync(STREAMS_DIR, { recursive: true });
+} catch {}
 
-// Origins permitidas (separadas por vírgula)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-// Rate limiting (login)
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
-const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 10 * 60 * 1000); // 10 minutos
+const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 10 * 60 * 1000);
 const loginAttempts = new Map();
 
 if (!fs.existsSync(ROOT)) fs.mkdirSync(ROOT, { recursive: true });
@@ -42,7 +54,7 @@ function readJson(filePath, fallback) {
     const raw = fs.readFileSync(filePath, "utf8");
     if (!raw.trim()) return fallback;
     return JSON.parse(raw);
-  } catch (e) {
+  } catch {
     return fallback;
   }
 }
@@ -67,9 +79,40 @@ function getUserPassword(username) {
   return username + "12345";
 }
 
-// Rate limiting middleware
+function clientIp(req) {
+  return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
+}
+
+function setCorsHeaders(res, origin) {
+  if (origin && ALLOWED_ORIGINS.length > 0 && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (ALLOWED_ORIGINS.length === 0) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Username, X-Api-Key");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+
+  if (NODE_ENV === "production") {
+    res.setHeader("Cache-Control", "no-store");
+  }
+}
+
+function checkOrigin(req, res) {
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.length > 0 && origin && !ALLOWED_ORIGINS.includes(origin)) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Origin not allowed" }));
+    return false;
+  }
+  return true;
+}
+
 function checkLoginRateLimit(req, res, origin) {
-  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
+  const ip = clientIp(req);
   const now = Date.now();
 
   if (!loginAttempts.has(ip)) {
@@ -78,7 +121,6 @@ function checkLoginRateLimit(req, res, origin) {
 
   const attempts = loginAttempts.get(ip);
 
-  // Reset se passou o window
   if (now - attempts.firstAttempt > LOGIN_WINDOW_MS) {
     attempts.count = 0;
     attempts.firstAttempt = now;
@@ -111,10 +153,10 @@ function createStream(username, apiKey) {
     if (fs.existsSync(playlist)) fs.unlinkSync(playlist);
     fs.readdirSync(dir).forEach(f => {
       if (f.endsWith(".ts") || f.endsWith(".m3u8")) {
-        try { fs.unlinkSync(path.join(dir, f)); } catch (e) {}
+        try { fs.unlinkSync(path.join(dir, f)); } catch {}
       }
     });
-  } catch (e) {}
+  } catch {}
 
   const stream = {
     username,
@@ -128,16 +170,16 @@ function createStream(username, apiKey) {
     videoPipe: null,
     ffmpegStarted: false,
     videoSocket: null,
-    lastLogTime: 0,
     packetCount: 0,
     totalBytes: 0,
     createdAt: Date.now(),
-    spsPpsSent: false,
     buffer: Buffer.alloc(0),
     awaitingSize: true,
     sizeValue: 0,
     sizeBuffer: Buffer.alloc(4),
-    sizePos: 0
+    sizePos: 0,
+    sentHeader: false,
+    pendingConfig: null
   };
 
   streams[username] = stream;
@@ -160,23 +202,23 @@ function deleteStream(username) {
   const meta = STREAM_META[username];
   if (!stream && !meta) return;
 
-  if (stream && stream.ffmpeg) {
-    try { stream.ffmpeg.kill("SIGTERM"); } catch (e) {}
+  if (stream?.ffmpeg) {
+    try { stream.ffmpeg.kill("SIGTERM"); } catch {}
   }
 
-  if (stream && stream.videoSocket) {
-    try { stream.videoSocket.destroy(); } catch (e) {}
+  if (stream?.videoSocket) {
+    try { stream.videoSocket.destroy(); } catch {}
   }
 
-  const dir = stream ? stream.dir : (meta ? meta.dir : null);
+  const dir = stream ? stream.dir : meta?.dir;
   try {
     if (dir && fs.existsSync(dir)) {
       fs.readdirSync(dir).forEach(f => {
-        try { fs.unlinkSync(path.join(dir, f)); } catch (e) {}
+        try { fs.unlinkSync(path.join(dir, f)); } catch {}
       });
-      try { fs.rmdirSync(dir); } catch (e) {}
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
-  } catch (e) {}
+  } catch {}
 
   delete streams[username];
   delete STREAM_META[username];
@@ -214,33 +256,108 @@ function startFfmpeg(stream) {
   stream.ffmpeg = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
   stream.videoPipe = stream.ffmpeg.stdin;
 
-  stream.ffmpeg.stderr.on("data", (data) => {
-    const line = data.toString();
-    console.log("FFmpeg[" + stream.username + "]", line.trim());
+  stream.ffmpeg.stderr.on("data", data => {
+    console.log("FFmpeg[" + stream.username + "]", data.toString().trim());
   });
 
-  stream.ffmpeg.on("close", (code) => {
+  stream.ffmpeg.on("close", code => {
     console.log("FFmpeg fechado para", stream.username, "code", code);
     stream.ffmpeg = null;
     stream.videoPipe = null;
     stream.ffmpegStarted = false;
   });
 
-  stream.ffmpeg.on("error", (err) => {
+  stream.ffmpeg.on("error", err => {
     console.log("FFmpeg erro para", stream.username, err.message);
     stream.ffmpegStarted = false;
   });
 }
 
+const START_CODE = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+function startsWithAnnexB(frame) {
+  return frame.length >= 4 &&
+    frame[0] === 0x00 &&
+    frame[1] === 0x00 &&
+    frame[2] === 0x00 &&
+    frame[3] === 0x01;
+}
+
+function convertLengthPrefixedToAnnexB(frame) {
+  const nalUnits = [];
+  let i = 0;
+
+  while (i + 4 <= frame.length) {
+    const len = ((frame[i] & 0xFF) << 24)
+      | ((frame[i + 1] & 0xFF) << 16)
+      | ((frame[i + 2] & 0xFF) << 8)
+      | (frame[i + 3] & 0xFF);
+
+    i += 4;
+    if (len <= 0 || i + len > frame.length) break;
+
+    const nal = Buffer.allocUnsafe(4 + len);
+    START_CODE.copy(nal, 0);
+    frame.copy(nal, 4, i, i + len);
+    nalUnits.push(nal);
+    i += len;
+  }
+
+  if (nalUnits.length === 0) return frame;
+  return Buffer.concat(nalUnits);
+}
+
+function normalizeH264(frame) {
+  return startsWithAnnexB(frame) ? frame : convertLengthPrefixedToAnnexB(frame);
+}
+
+function looksLikeAvcConfig(buf) {
+  if (!buf || buf.length < 8) return false;
+  return !(buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x00 && buf[3] === 0x01);
+}
+
+function isIdrFrame(frame) {
+  if (!frame || frame.length < 5) return false;
+  const idx = startsWithAnnexB(frame) ? 4 : 0;
+  return (frame[idx] & 0x1f) === 5;
+}
+
+function processFrame(stream, frameData) {
+  if (!frameData || frameData.length === 0) return;
+
+  if (!stream.ffmpegStarted) startFfmpeg(stream);
+
+  if (!stream.sentHeader && looksLikeAvcConfig(frameData)) {
+    stream.sentHeader = true;
+    const converted = convertLengthPrefixedToAnnexB(frameData);
+    if (stream.videoPipe?.writable) stream.videoPipe.write(converted);
+    stream.packetCount++;
+    stream.totalBytes += frameData.length;
+    return;
+  }
+
+  const normalized = normalizeH264(frameData);
+
+  if (isIdrFrame(normalized) && stream.pendingConfig && stream.videoPipe?.writable) {
+    stream.videoPipe.write(stream.pendingConfig);
+    stream.pendingConfig = null;
+  }
+
+  if (stream.videoPipe?.writable) stream.videoPipe.write(normalized);
+
+  stream.packetCount++;
+  stream.totalBytes += frameData.length;
+}
+
 function startVideoServer(stream) {
-  const videoServer = net.createServer((socket) => {
+  const videoServer = net.createServer(socket => {
     stream.videoSocket = socket;
     socket.setKeepAlive(true, 1000);
     socket.setNoDelay(true);
 
     console.log("Cliente de vídeo conectado para", stream.username);
 
-    socket.on("data", (data) => {
+    socket.on("data", data => {
       stream.buffer = Buffer.concat([stream.buffer, data]);
 
       while (true) {
@@ -280,12 +397,12 @@ function startVideoServer(stream) {
       stream.videoSocket = null;
     });
 
-    socket.on("error", (err) => {
+    socket.on("error", err => {
       console.log("Erro no socket de vídeo para", stream.username, err.message);
     });
   });
 
-  videoServer.on("error", (err) => {
+  videoServer.on("error", err => {
     console.log("Erro no servidor de vídeo para", stream.username, "porta", stream.videoPort, err.message);
   });
 
@@ -296,93 +413,8 @@ function startVideoServer(stream) {
   return videoServer;
 }
 
-function processFrame(stream, frameData) {
-  if (!frameData || frameData.length === 0) return;
-
-  if (!stream.ffmpegStarted) startFfmpeg(stream);
-
-  if (!stream.sentHeader && looksLikeAvcConfig(frameData)) {
-    stream.sentHeader = true;
-    const converted = convertLengthPrefixedToAnnexB(frameData);
-    if (stream.videoPipe && stream.videoPipe.writable) {
-      stream.videoPipe.write(converted);
-    }
-    stream.packetCount++;
-    stream.totalBytes += frameData.length;
-    return;
-  }
-
-  const normalized = normalizeH264(frameData);
-
-  if (isIdrFrame(normalized) && stream.pendingConfig) {
-    if (stream.videoPipe && stream.videoPipe.writable) {
-      stream.videoPipe.write(stream.pendingConfig);
-    }
-    stream.pendingConfig = null;
-  }
-
-  if (stream.videoPipe && stream.videoPipe.writable) {
-    stream.videoPipe.write(normalized);
-  }
-
-  stream.packetCount++;
-  stream.totalBytes += frameData.length;
-  stream.lastLogTime = Date.now();
-}
-
-function looksLikeAvcConfig(buf) {
-  if (!buf || buf.length < 8) return false;
-  return !(buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x00 && buf[3] === 0x01);
-}
-
-function normalizeH264(frame) {
-  if (startsWithAnnexB(frame)) return frame;
-  return convertLengthPrefixedToAnnexB(frame);
-}
-
-function startsWithAnnexB(frame) {
-  return frame.length >= 4 &&
-    frame[0] === 0x00 &&
-    frame[1] === 0x00 &&
-    frame[2] === 0x00 &&
-    frame[3] === 0x01;
-}
-
-function convertLengthPrefixedToAnnexB(frame) {
-  const nalUnits = [];
-  let i = 0;
-
-  while (i + 4 <= frame.length) {
-    const len = ((frame[i] & 0xFF) << 24)
-      | ((frame[i + 1] & 0xFF) << 16)
-      | ((frame[i + 2] & 0xFF) << 8)
-      | (frame[i + 3] & 0xFF);
-
-    i += 4;
-    if (len <= 0 || i + len > frame.length) break;
-
-    const nal = Buffer.allocUnsafe(4 + len);
-    START_CODE.copy(nal, 0);
-    frame.copy(nal, 4, i, i + len);
-    nalUnits.push(nal);
-    i += len;
-  }
-
-  if (nalUnits.length === 0) return frame;
-  return Buffer.concat(nalUnits);
-}
-
-function isIdrFrame(frame) {
-  if (!frame || frame.length < 5) return false;
-  const idx = startsWithAnnexB(frame) ? 4 : 0;
-  const nalType = frame[idx] & 0x1f;
-  return nalType === 5;
-}
-
-const START_CODE = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-
 function startAudioServer(stream) {
-  const audioServer = net.createServer((socket) => {
+  const audioServer = net.createServer(socket => {
     console.log("Cliente de áudio conectado para", stream.username);
     socket.on("data", () => {});
     socket.on("error", () => {});
@@ -391,7 +423,7 @@ function startAudioServer(stream) {
     });
   });
 
-  audioServer.on("error", (err) => {
+  audioServer.on("error", err => {
     console.log("Erro no servidor de áudio para", stream.username, "porta", stream.audioPort, err.message);
   });
 
@@ -400,34 +432,6 @@ function startAudioServer(stream) {
   });
 
   return audioServer;
-}
-
-function checkOrigin(req, res) {
-  const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.length > 0 && origin && !ALLOWED_ORIGINS.includes(origin)) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Origin not allowed" }));
-    return false;
-  }
-  return true;
-}
-
-function setCorsHeaders(res, origin) {
-  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
-  else if (ALLOWED_ORIGINS.length > 0) res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGINS[0]);
-  else res.setHeader("Access-Control-Allow-Origin", "*");
-
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Username, X-Api-Key");
-
-  // Segurança adicional
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("X-XSS-Protection", "1; mode=block");
-
-  if (NODE_ENV === "production") {
-    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-  }
 }
 
 function findUsernameByApiKey(apiKey) {
@@ -474,7 +478,7 @@ function requireStream(req, res, origin) {
   return stream;
 }
 
-function handleRequest(req, res, isHttps = false) {
+function handleRequest(req, res) {
   const origin = req.headers.origin;
 
   if (req.method === "OPTIONS") {
@@ -486,8 +490,6 @@ function handleRequest(req, res, isHttps = false) {
 
   if (req.url === "/api/login" && req.method === "POST") {
     if (!checkOrigin(req, res)) return;
-
-    // Rate limiting
     if (!checkLoginRateLimit(req, res, origin)) return;
 
     let body = "";
@@ -510,20 +512,17 @@ function handleRequest(req, res, isHttps = false) {
           return;
         }
 
-        // Reset rate limit após login bem-sucedido
-        const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
-        loginAttempts.delete(ip);
+        loginAttempts.delete(clientIp(req));
 
         if (!USER_KEYS[username]) {
           USER_KEYS[username] = crypto.randomBytes(24).toString("hex");
           saveUsers();
         }
 
-        const apiKey = USER_KEYS[username];
         setCorsHeaders(res, origin);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ username, apiKey }, null, 2));
-      } catch (e) {
+        res.end(JSON.stringify({ username, apiKey: USER_KEYS[username] }, null, 2));
+      } catch {
         setCorsHeaders(res, origin);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON" }));
@@ -538,9 +537,7 @@ function handleRequest(req, res, isHttps = false) {
     const authObj = validateApiKey(req, res, origin);
     if (!authObj) return;
 
-    if (streams[authObj.username] || STREAM_META[authObj.username]) {
-      deleteStream(authObj.username);
-    }
+    if (streams[authObj.username] || STREAM_META[authObj.username]) deleteStream(authObj.username);
 
     const newStream = createStream(authObj.username, authObj.apiKey);
     startVideoServer(newStream);
@@ -552,20 +549,18 @@ function handleRequest(req, res, isHttps = false) {
       username: newStream.username,
       videoPort: newStream.videoPort,
       audioPort: newStream.audioPort,
-      baseUrl: `http${isHttps ? "s" : ""}://${req.headers.host || "localhost"}`,
-      streamUrl: `http${isHttps ? "s" : ""}://${req.headers.host || "localhost"}/live/${newStream.username}/${newStream.apiKey}/stream.m3u8`
+      baseUrl: `https://${req.headers.host || "localhost"}`,
+      streamUrl: `https://${req.headers.host || "localhost"}/live/${newStream.username}/${newStream.apiKey}/stream.m3u8`
     }, null, 2));
     return;
   }
 
   if (req.url === "/api/stream" && req.method === "DELETE") {
     if (!checkOrigin(req, res)) return;
-
     const authObj = validateApiKey(req, res, origin);
     if (!authObj) return;
 
     deleteStream(authObj.username);
-
     setCorsHeaders(res, origin);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
@@ -574,7 +569,6 @@ function handleRequest(req, res, isHttps = false) {
 
   if (req.url === "/api/stream" && req.method === "GET") {
     if (!checkOrigin(req, res)) return;
-
     const stream = requireStream(req, res, origin);
     if (!stream) return;
 
@@ -605,13 +599,11 @@ function handleRequest(req, res, isHttps = false) {
     }
 
     const stream = streams[username];
-    const streamUrl = `http${isHttps ? "s" : ""}://${req.headers.host || "localhost"}/live/${stream.username}/${stream.apiKey}/stream.m3u8`;
-
     setCorsHeaders(res, origin);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       username: stream.username,
-      streamUrl
+      streamUrl: `https://${req.headers.host || "localhost"}/live/${stream.username}/${stream.apiKey}/stream.m3u8`
     }, null, 2));
     return;
   }
@@ -623,7 +615,7 @@ function handleRequest(req, res, isHttps = false) {
     return;
   }
 
-  const liveMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream\\.m3u8$").exec(req.url);
+ const liveMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream\\.m3u8$").exec(req.url);
   if (liveMatch) {
     const [, username, apiKey] = liveMatch;
     const stream = streams[username];
@@ -636,8 +628,7 @@ function handleRequest(req, res, isHttps = false) {
     }
 
     if (!fs.existsSync(stream.playlist)) {
-      const fallback = "#EXTM3U#EXT-X-VERSION:3#EXT-X-TARGETDURATION:1#EXT-X-MEDIA-SEQUENCE:0#EXT-X-PLAYLIST-TYPE:EVENT";
-      fs.writeFileSync(stream.playlist, fallback, "utf8");
+      fs.writeFileSync(stream.playlist, "#EXTM3U#EXT-X-VERSION:3#EXT-X-TARGETDURATION:1#EXT-X-MEDIA-SEQUENCE:0#EXT-X-PLAYLIST-TYPE:EVENT", "utf8");
     }
 
     setCorsHeaders(res, origin);
@@ -651,7 +642,7 @@ function handleRequest(req, res, isHttps = false) {
     return;
   }
 
-  const segmentMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream(\\d+)\\.ts$").exec(req.url);
+ const segmentMatch = new RegExp("^\\/live\\/([a-zA-Z0-9_-]+)\\/([a-f0-9]+)\\/stream(\\d+)\\.ts$").exec(req.url);
   if (segmentMatch) {
     const [, username, apiKey, index] = segmentMatch;
     const stream = streams[username];
@@ -663,9 +654,7 @@ function handleRequest(req, res, isHttps = false) {
       return;
     }
 
-    const fileName = `stream${index}.ts`;
-    const filePath = path.join(stream.dir, fileName);
-
+    const filePath = path.join(stream.dir, `stream${index}.ts`);
     if (fs.existsSync(filePath)) {
       const stat = fs.statSync(filePath);
       setCorsHeaders(res, origin);
@@ -675,11 +664,12 @@ function handleRequest(req, res, isHttps = false) {
         "Cache-Control": "no-cache, no-store, must-revalidate"
       });
       fs.createReadStream(filePath).pipe(res);
-    } else {
-      setCorsHeaders(res, origin);
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Segment not found");
+      return;
     }
+
+    setCorsHeaders(res, origin);
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Segment not found");
     return;
   }
 
@@ -688,36 +678,14 @@ function handleRequest(req, res, isHttps = false) {
   res.end("Not found");
 }
 
-const httpServer = http.createServer((req, res) => {
-  handleRequest(req, res, false);
-});
+const server = http.createServer(handleRequest);
 
-httpServer.on("error", (err) => {
+server.on("error", err => {
   console.log("Erro no servidor HTTP:", err.message);
 });
 
-// HTTPS (opcional, se certificados existirem)
-if (process.env.HTTPS_ENABLED === "true" && fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
-  const httpsOptions = {
-    key: fs.readFileSync(SSL_KEY_PATH),
-    cert: fs.readFileSync(SSL_CERT_PATH)
-  };
-
-  const httpsServer = https.createServer(httpsOptions, (req, res) => {
-    handleRequest(req, res, true);
-  });
-
-  httpsServer.on("error", (err) => {
-    console.log("Erro no servidor HTTPS:", err.message);
-  });
-
-  httpsServer.listen(HTTPS_PORT, "0.0.0.0", () => {
-    console.log(`HTTPS em https://localhost:${HTTPS_PORT}`);
-  });
-}
-
-httpServer.listen(HTTP_PORT, "0.0.0.0", () => {
-  console.log(`HTTP em http://localhost:${HTTP_PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP em http://0.0.0.0:${PORT}`);
 });
 
 function getHtmlPage() {
@@ -746,7 +714,6 @@ function getHtmlPage() {
         return;
       }
 
-      // Garante que o vídeo não está mutado
       video.muted = false;
       video.volume = 1.0;
 
@@ -767,8 +734,6 @@ function getHtmlPage() {
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
-        video.muted = false;
-        video.volume = 1.0;
         video.addEventListener('loadedmetadata', function() {
           video.play().catch(function(err) { console.log('Play error:', err); });
         });
