@@ -42,25 +42,46 @@ const HTML_PAGE = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <video id="video" controls autoplay playsinline muted></video>
+  <video id="video" controls autoplay playsinline ></video>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script>
     (function () {
       var video = document.getElementById('video');
       var params = new URLSearchParams(window.location.search);
-      var user = params.get('u') || 'nicolas';
-      var sid = params.get('s') || 'live1';
+      var user = params.get('u');
+      var sid = params.get('s');
+
+      function sanitize(value, maxLen) {
+        if (maxLen === undefined) maxLen = 24;
+        return String(value || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]/g, "_")
+          .replace(/_+/g, "_")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, maxLen);
+      }
+
+      user = sanitize(user, 24);
+      sid = sanitize(sid, 24);
+
+      if (!user || !sid) {
+        document.body.innerHTML = '<div style="color:#fff;font-family:sans-serif;padding:20px">Faltou usuario ou id da live.</div>';
+        return;
+      }
+
       var src = window.location.origin + '/streams/' + user + '/' + sid + '/stream.m3u8';
 
       function start() {
         if (window.Hls && Hls.isSupported()) {
           var hls = new Hls({
             liveSyncDurationCount: 1,
-            liveMaxLatencyDurationCount: 3,
-            maxBufferLength: 4,
+            liveMaxLatencyDurationCount: 2,
+            maxBufferLength: 2,
             backBufferLength: 0,
             enableWorker: true,
-            lowLatencyMode: false
+            lowLatencyMode: true,
+            maxLiveSyncPlaybackRate: 1.5
           });
 
           hls.loadSource(src);
@@ -75,7 +96,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             if (data.fatal) {
               setTimeout(function () {
                 hls.loadSource(src);
-              }, 2000);
+              }, 1500);
             }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -94,7 +115,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         if (video.paused) {
           video.play().catch(function () {});
         }
-      }, 1500);
+      }, 1000);
     })();
   </script>
 </body>
@@ -141,6 +162,22 @@ function parseAuthLine(line) {
   };
 }
 
+function addAdtsHeader(aacFrame) {
+  const profile = 2;
+  const freqIdx = 4;
+  const chanCfg = 1;
+  const frameLength = aacFrame.length + 7;
+  const adts = Buffer.alloc(7);
+  adts[0] = 0xFF;
+  adts[1] = 0xF1;
+  adts[2] = ((profile - 1) << 6) + (freqIdx << 2) + (chanCfg >> 2);
+  adts[3] = ((chanCfg & 3) << 6) + (frameLength >> 11);
+  adts[4] = (frameLength >> 3) & 0xFF;
+  adts[5] = ((frameLength & 7) << 5) + 0x1F;
+  adts[6] = 0xFC;
+  return Buffer.concat([adts, aacFrame]);
+}
+
 function startFfmpeg(live) {
   if (live.ffmpeg) return;
 
@@ -152,20 +189,22 @@ function startFfmpeg(live) {
   const args = [
     "-hide_banner",
     "-y",
-    "-loglevel", "info",
+    "-loglevel", "warning",
     "-fflags", "+genpts+discardcorrupt+nobuffer",
     "-flags", "low_delay",
     "-use_wallclock_as_timestamps", "1",
-    "-probesize", "5000000",
-    "-analyzeduration", "5000000",
+    "-probesize", "1000000",
+    "-analyzeduration", "1000000",
     "-f", "h264",
     "-i", "pipe:0",
-    "-an",
+    "-f", "aac",
+    "-i", "pipe:3",
     "-c:v", "copy",
+    "-c:a", "copy",
     "-f", "hls",
-    "-hls_time", "1",
-    "-hls_list_size", "6",
-    "-hls_delete_threshold", "2",
+    "-hls_time", "0.5",
+    "-hls_list_size", "3",
+    "-hls_delete_threshold", "1",
     "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments+temp_file",
     "-hls_segment_filename", segmentPattern,
     playlist
@@ -175,14 +214,31 @@ function startFfmpeg(live) {
   console.log("[FFmpeg] Dir: " + live.dir);
   console.log("[FFmpeg] Playlist: " + playlist);
 
-  live.ffmpeg = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
+  live.ffmpeg = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe", "pipe"] });
   live.videoPipe = live.ffmpeg.stdin;
+  live.audioPipe = live.ffmpeg.stdio[3];
+
+  if (live.videoPipe) {
+    live.videoPipe.on("error", function (err) {
+      console.log("[VIDEO PIPE ERRO] " + live.key + ": " + err.message);
+    });
+  }
+
+  if (live.audioPipe) {
+    live.audioPipe.on("error", function (err) {
+      console.log("[AUDIO PIPE ERRO] " + live.key + ": " + err.message);
+    });
+  }
 
   live.ffmpeg.stderr.on("data", function (data) {
     const txt = String(data).trim();
     if (txt) {
       console.log("[FFmpeg " + live.key + "] " + txt);
     }
+  });
+
+  live.ffmpeg.stderr.on("error", function (err) {
+    console.log("[FFmpeg STDERR ERRO] " + live.key + ": " + err.message);
   });
 
   live.ffmpeg.stdout.on("data", function (data) {
@@ -192,11 +248,17 @@ function startFfmpeg(live) {
     }
   });
 
+  live.ffmpeg.stdout.on("error", function (err) {
+    console.log("[FFmpeg STDOUT ERRO] " + live.key + ": " + err.message);
+  });
+
   live.ffmpeg.on("close", function (code, signal) {
     console.log("[FFmpeg] Finalizou " + live.key + " code=" + code + " signal=" + signal);
     try { if (live.videoPipe) live.videoPipe.destroy(); } catch (e) {}
+    try { if (live.audioPipe) live.audioPipe.destroy(); } catch (e) {}
     live.ffmpeg = null;
     live.videoPipe = null;
+    live.audioPipe = null;
     live.videoSocket = null;
     live.audioSocket = null;
     rmDir(live.dir);
@@ -214,6 +276,7 @@ function stopLive(live) {
   console.log("[STOP] Encerrando " + live.key);
 
   try { if (live.videoPipe) live.videoPipe.end(); } catch (e) {}
+  try { if (live.audioPipe) live.audioPipe.end(); } catch (e) {}
   try { if (live.ffmpeg) live.ffmpeg.kill("SIGKILL"); } catch (e) {}
   try { if (live.videoSocket) live.videoSocket.destroy(); } catch (e) {}
   try { if (live.audioSocket) live.audioSocket.destroy(); } catch (e) {}
@@ -231,6 +294,7 @@ function bindSocketAuth(socket, kind) {
   let buffer = Buffer.alloc(0);
   let authenticated = false;
   let live = null;
+  let audioParseBuffer = Buffer.alloc(0);
 
   socket.on("data", function (data) {
     if (!authenticated) {
@@ -261,6 +325,7 @@ function bindSocketAuth(socket, kind) {
           streamId: auth.streamId,
           ffmpeg: null,
           videoPipe: null,
+          audioPipe: null,
           videoSocket: null,
           audioSocket: null
         };
@@ -283,8 +348,14 @@ function bindSocketAuth(socket, kind) {
       authenticated = true;
 
       if (buffer.length > 0 && kind === "VIDEO" && live.videoPipe && !live.videoPipe.destroyed) {
-        live.videoPipe.write(buffer);
-        console.log("[VIDEO] Enviou buffer residual: " + buffer.length + " bytes");
+        try {
+          live.videoPipe.write(buffer);
+          console.log("[VIDEO] Enviou buffer residual: " + buffer.length + " bytes");
+        } catch (e) {}
+      }
+
+      if (buffer.length > 0 && kind === "AUDIO") {
+        audioParseBuffer = Buffer.concat([audioParseBuffer, buffer]);
       }
 
       buffer = Buffer.alloc(0);
@@ -295,9 +366,34 @@ function bindSocketAuth(socket, kind) {
 
     if (kind === "VIDEO") {
       if (live.videoPipe && !live.videoPipe.destroyed) {
-        const ok = live.videoPipe.write(data);
-        if (!ok) {
-          live.videoPipe.once("drain", function () {});
+        try {
+          const ok = live.videoPipe.write(data);
+          if (!ok) {
+            live.videoPipe.once("drain", function () {});
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (kind === "AUDIO") {
+      audioParseBuffer = Buffer.concat([audioParseBuffer, data]);
+
+      while (audioParseBuffer.length >= 4) {
+        const frameLen = (audioParseBuffer[0] << 24) | (audioParseBuffer[1] << 16) | (audioParseBuffer[2] << 8) | audioParseBuffer[3];
+        if (frameLen <= 0 || frameLen > 65536) {
+          audioParseBuffer = audioParseBuffer.slice(1);
+          continue;
+        }
+        if (audioParseBuffer.length < 4 + frameLen) break;
+
+        const aacFrame = audioParseBuffer.slice(4, 4 + frameLen);
+        audioParseBuffer = audioParseBuffer.slice(4 + frameLen);
+
+        if (live.audioPipe && !live.audioPipe.destroyed) {
+          try {
+            const withAdts = addAdtsHeader(aacFrame);
+            live.audioPipe.write(withAdts);
+          } catch (e) {}
         }
       }
     }
