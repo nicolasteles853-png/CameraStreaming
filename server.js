@@ -6,10 +6,9 @@ const { spawn } = require("child_process");
 
 const PORT_VIDEO = 3001;
 const PORT_AUDIO = 3002;
-const HTTP_PORT = 3000;
+const HTTP_PORT = process.env.PORT || 3000;
 
-const ROOT = "/data/data/com.termux/files/home/CameraStreaming";
-const STREAMS_ROOT = path.join(ROOT, "streams");
+const STREAMS_ROOT = path.join(process.cwd(), "streams");
 
 if (!fs.existsSync(STREAMS_ROOT)) {
   fs.mkdirSync(STREAMS_ROOT, { recursive: true });
